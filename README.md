@@ -9,12 +9,9 @@ Umožňuje vyhledat průběh soudního řízení, nařízená jednání a událo
 ## Instalace
 
 ```bash
-pip install git+https://github.com/pravnikovo-info/infosoud.git
+pip install infosoud
 ```
 
-Až bude balíček na PyPI:
-```bash
-pip install infosoud
 ```
 
 ## Použití
