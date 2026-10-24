@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from .client import InfoSoudClient, parse_spis_zn, EVENT_LABELS
 
 
-def format_case_summary(data: dict) -> str:
+def format_case_summary(data: dict, subject: str | None = None) -> str:
     """Format case data into human-readable summary."""
     lines = []
     org = data.get("organizace", "?")
@@ -31,6 +32,8 @@ def format_case_summary(data: dict) -> str:
     lines.append(f"Sp. zn.: {spzn}")
     lines.append(f"Soud: {org}" + (f" ({nadr})" if nadr else ""))
     lines.append(f"Stav: {stav}" + (f" (od {stav_datum})" if stav_datum else ""))
+    if subject:
+        lines.append(f"Předmět řízení: {subject}")
 
     events = data.get("udalosti") or []
     if events:
@@ -45,18 +48,19 @@ def format_case_summary(data: dict) -> str:
     return "\n".join(lines)
 
 
-def format_hearings_summary(data: dict) -> str:
+def format_hearings_summary(hearings: list[dict],
+                            org: str = "?") -> str:
     """Format hearings data into human-readable summary."""
-    lines = [f"Jednání — {data.get('organizace', '?')}"]
-    events = data.get("udalosti") or []
-    if not events:
+    lines = [f"Jednání — {org}"]
+    if not hearings:
         lines.append("  Žádná jednání nařízena.")
         return "\n".join(lines)
-    for ev in events:
+    for ev in hearings:
         zruseno = " [ZRUŠENO]" if ev.get("jednaniZruseno") else ""
         lines.append(f"  {ev.get('datum', '?')} {ev.get('cas', '?')}  "
                      f"{ev.get('druhJednani', '?')}{zruseno}")
-        lines.append(f"    Soudce: {ev.get('resitel', '?')}")
+        if ev.get("resitel"):
+            lines.append(f"    Soudce: {ev['resitel']}")
         lines.append(f"    Síň: {ev.get('jednaciSin', '?')}")
     return "\n".join(lines)
 
@@ -106,7 +110,6 @@ def main():
 
     if not court_code:
         # Check if trailing text in spis_zn is a court name
-        import re
         m = re.match(
             r"((?:\d+\s*[A-Za-z]+\s*\d+\s*[/_]\s*\d{4}))\s+(.+)$",
             spis_zn_raw.strip(),
@@ -133,15 +136,20 @@ def main():
 
     try:
         if args.hearings:
-            data = client.search_hearings(spis_zn, code)
+            case_data = client.search_case(spis_zn, code)
+            hearings = client.get_hearing_details(
+                spis_zn, code, case_data=case_data)
             if args.json_out:
-                print(json.dumps(data, ensure_ascii=False, indent=2))
+                print(json.dumps(hearings, ensure_ascii=False, indent=2))
             else:
-                print(format_hearings_summary(data))
+                print(format_hearings_summary(
+                    hearings, org=case_data.get("organizace", "?")))
         else:
             data = client.search_case(spis_zn, code)
+            subject = client.get_case_subject(spis_zn, code)
             if args.json_out:
-                print(json.dumps(data, ensure_ascii=False, indent=2))
+                out = {**data, "predmetRizeni": subject} if subject else data
+                print(json.dumps(out, ensure_ascii=False, indent=2))
             elif args.csv_out:
                 events = data.get("udalosti") or []
                 print("datum;udalost;zruseno;souvisejici_spzn;soud")
@@ -155,7 +163,7 @@ def main():
                            f"{zid.get('organizace', '')}").strip()
                     print(f"{ev.get('datum', '')};{label};{zr};{rel};{data.get('organizace', '')}")
             else:
-                print(format_case_summary(data))
+                print(format_case_summary(data, subject=subject))
     except Exception as e:
         print(f"Chyba: {e}", file=sys.stderr)
         sys.exit(1)

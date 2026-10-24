@@ -23,8 +23,15 @@ CACHE_TTL_HEARINGS = 3600       # 1 hour for hearings
 # Druh věci specific to Nejvyšší soud (auto-detected, no court code needed)
 _NS_DRUHY = {"CDO", "ODO", "TDO", "TZ", "NCU", "TKCDO", "NSCR", "ICM"}
 
-_SPZN_UNIVERSAL = re.compile(
-    r"(\d+)\s*([A-Za-z]+)\s*(\d+)\s*[/_]\s*(\d{4})"
+# Spaced form with multi-word druh: "3 P A NC 53/2026", "1 T 64/2024"
+_SPZN_SPACED = re.compile(
+    r"(\d+)\s+((?:[A-Za-z]+\s+)*[A-Za-z]+)\s+(\d+)\s*[/_]\s*(\d{4})"
+    r"(?:\s+([A-Z][A-Z0-9]{4,9}))?$"
+)
+# Mixed/compact form: "1T64/2024", "1 T64/2024", "1T 64/2024", "1T64_2024"
+# Also handles dot-separated multi-word druh: "3P.A.NC53_2026"
+_SPZN_MIXED = re.compile(
+    r"(\d+)\s*([A-Za-z]+(?:\.[A-Za-z]+)*)\s*(\d+)\s*[/_]\s*(\d{4})"
     r"(?:\s+([A-Z][A-Z0-9]{4,9}))?$"
 )
 
@@ -63,8 +70,12 @@ class SpisZn:
         return f"{self.cislo_senatu} {self.druh_veci} {self.bc_vec}/{self.rocnik}"
 
     def compact(self) -> str:
-        """Compact form: '1T64_2024'."""
-        return f"{self.cislo_senatu}{self.druh_veci}{self.bc_vec}_{self.rocnik}"
+        """Compact form for URLs: '1T64_2024'.
+
+        Multi-word druh věci uses dots: '3P.A.NC53_2026'.
+        """
+        druh = self.druh_veci.replace(" ", ".")
+        return f"{self.cislo_senatu}{druh}{self.bc_vec}_{self.rocnik}"
 
     def __str__(self) -> str:
         s = self.canonical()
@@ -82,23 +93,28 @@ def parse_spis_zn(text: str) -> SpisZn:
         "1 T64/2024"        "1T64_2024"        "1 T 64 / 2024"
         "43T191_2024"       "43 T 191/2024 OSPHA09"
         "11 C 233/2022"     "2 To 29/2023"     "6To436/2025"
+    Multi-word druh věci is supported in spaced forms:
+        "3 P A NC 53/2026"  "3 P A NC 53/2026 OSSTCKH"
     """
     text = text.strip()
 
-    m = _SPZN_UNIVERSAL.match(text)
-    if m:
-        druh = m.group(2)
-        court = m.group(5) if m.group(5) else None
-        # Auto-detect Nejvyšší soud from druh věci (CDO, ODO, TDO, TZ, NCU)
-        if not court and druh.upper() in _NS_DRUHY:
-            court = "NS"
-        return SpisZn(
-            cislo_senatu=int(m.group(1)),
-            druh_veci=druh,
-            bc_vec=int(m.group(3)),
-            rocnik=int(m.group(4)),
-            court_code=court,
-        )
+    # Try spaced form first (handles multi-word druh), then mixed/compact
+    for pattern in (_SPZN_SPACED, _SPZN_MIXED):
+        m = pattern.match(text)
+        if m:
+            # Dots in compact form represent spaces: "P.A.NC" → "P A NC"
+            druh = m.group(2).replace(".", " ")
+            court = m.group(5) if m.group(5) else None
+            # Auto-detect Nejvyšší soud from druh věci (CDO, ODO, TDO, TZ, NCU)
+            if not court and druh.upper().replace(" ", "") in _NS_DRUHY:
+                court = "NS"
+            return SpisZn(
+                cislo_senatu=int(m.group(1)),
+                druh_veci=druh,
+                bc_vec=int(m.group(3)),
+                rocnik=int(m.group(4)),
+                court_code=court,
+            )
 
     raise ValueError(f"Cannot parse spisová značka: {text!r}")
 
@@ -174,6 +190,14 @@ HISTORICAL_COURTS = {
     "OSJIMJR": "Okresní soud v Jaroslavicích (zrušen)",
     "OSSEMOD": "Okresní soud v Odrách (zrušen)",
 }
+
+
+def district_in_region(os_code: str, ks_code: str) -> bool:
+    """True if district court `os_code` belongs to the region of regional/municipal court `ks_code`."""
+    os_code, ks_code = os_code.upper(), ks_code.upper()
+    if not os_code.startswith("OS") or len(ks_code) < 5:
+        return False
+    return os_code[2:5] == ks_code[2:5]
 
 
 def resolve_court_code(code: str) -> str:
@@ -300,9 +324,115 @@ class InfoSoudClient:
         return self._get("/organizace/lov")
 
     def get_district_courts(self, ks_code: str | None = None) -> list[dict]:
-        """Get list of okresní soudy, optionally filtered by KS."""
-        params = {"kod": ks_code} if ks_code else None
-        return self._get("/organizace/podrizene/lov", params=params)
+        """Get list of okresní soudy, optionally only those in the region of `ks_code`.
+
+        The API ignores its `kod` filter and always returns all ~86 district courts,
+        so the region is filtered here by the court code: KS<region><city> -> OS<region>…
+        (e.g. KSZPCPM -> OSZPC*, MSPHAAB -> OSPHA*).
+        """
+        courts = self._get("/organizace/podrizene/lov", params={"kod": ks_code} if ks_code else None)
+        if not ks_code:
+            return courts
+        return [c for c in courts if district_in_region(c.get("kod", ""), ks_code)]
+
+    def get_case_subject(self, spis_zn: str | SpisZn,
+                         court_code: str | None = None) -> str | None:
+        """Fetch předmět řízení (case subject) from ZAHAJ_RIZ event detail.
+
+        Returns the subject string, or None if not available.
+        """
+        try:
+            detail = self.get_event_detail(spis_zn, court_code, "ZAHAJ_RIZ", 1)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code >= 500:
+                raise
+            return None
+        for attr in detail.get("atributy", []):
+            if attr.get("typ") == "PREDM_RIZ":
+                value = attr.get("hodnota", "")
+                if value and value != "-":
+                    return value
+        return None
+
+    def get_hearing_details(self, spis_zn: str | SpisZn,
+                            court_code: str | None = None,
+                            case_data: dict | None = None) -> list[dict]:
+        """Fetch hearing details from NAR_JED events.
+
+        Uses /jednani/vyhledej as primary source, then supplements with
+        NAR_JED events from the case timeline (including multi-day hearings
+        listed in the ``jednani`` sub-array of each event).
+
+        Returns list of dicts with datum, cas, druhJednani, jednaciSin, zruseno.
+        """
+        if isinstance(spis_zn, str):
+            spis_zn = parse_spis_zn(spis_zn)
+        code = court_code or spis_zn.court_code
+
+        # Try the hearings endpoint first
+        hearings_data = self.search_hearings(spis_zn, code)
+        hearings = hearings_data.get("udalosti", [])
+
+        # Only trust the endpoint if it has non-cancelled hearings;
+        # otherwise fall through to the NAR_JED event detail fallback.
+        has_active = any(
+            h.get("jednaniZruseno") not in ("Ano", True)
+            for h in hearings
+        )
+        if has_active:
+            return hearings
+
+        # Fall back: extract from NAR_JED events in case timeline
+        if case_data is None:
+            case_data = self.search_case(spis_zn, code)
+        nar_events = [
+            ev for ev in (case_data.get("udalosti") or [])
+            if ev.get("udalost") == "NAR_JED" and not ev.get("zruseno")
+        ]
+        if not nar_events:
+            return hearings  # return cancelled hearings if no NAR_JED at all
+
+        results = []
+        for ev in nar_events:
+            # Collect all poradi values: the event itself + multi-day sub-items
+            poradi_list = []
+            main_poradi = ev.get("poradi")
+            if main_poradi is not None:
+                poradi_list.append(main_poradi)
+            for sub in ev.get("jednani", []):
+                sub_poradi = sub.get("poradiUdalosti")
+                if sub_poradi is not None:
+                    poradi_list.append(sub_poradi)
+
+            if not poradi_list:
+                logger.warning("NAR_JED event missing 'poradi', skipping: %s", ev)
+                continue
+
+            for poradi in poradi_list:
+                try:
+                    detail = self.get_event_detail(
+                        spis_zn, code, "NAR_JED", poradi)
+                except requests.HTTPError:
+                    continue
+                attrs = {a.get("typ"): a.get("hodnota", "")
+                         for a in detail.get("atributy", [])
+                         if a.get("typ")}
+                zruseno = attrs.get("JED_ZRUS", "Ne") == "Ano"
+                if zruseno:
+                    continue
+                # Parse "19.05.2026 08:30" → date + time
+                d_zac = attrs.get("JED_D_ZAC", "")
+                parts = d_zac.split(" ", 1)
+                datum = parts[0] if parts[0] else ev.get("datum", "?")
+                cas = parts[1] if len(parts) > 1 else "?"
+                results.append({
+                    "datum": datum,
+                    "cas": cas,
+                    "druhJednani": attrs.get("JED_DRUH", "?"),
+                    "jednaciSin": attrs.get("JED_SIN", "?"),
+                    "jednaniZruseno": False,
+                })
+        return results
 
     def build_court_map(self) -> dict[str, str]:
         """Fetch and build complete court code → name mapping.
@@ -332,6 +462,7 @@ EVENT_LABELS = {
     "ODVOLANI": "Řízení o odvolání",
     "DOVOL_RIZ": "Řízení o dovolání",
     "NAD_RIZENI": "Řízení u nadřízeného soudu",
+    "ST_VEC_VYR": "Vyřízení věci",
     "ST_VEC_ODS": "Skončení věci",
     "ST_VEC_OBZ": "Obživnutí věci",
     "ST_VEC_PRE": "Přerušení řízení",
@@ -345,8 +476,18 @@ EVENT_LABELS = {
     "VR_SP_NS": "Vrácení spisu odvolacímu soudu",
 }
 
+# Event detail attribute labels
+ATTR_LABELS = {
+    "PREDM_RIZ": "Předmět řízení",
+    "PRED_VEC": "Předaná věc",
+    "JED_DRUH": "Druh jednání",
+    "JED_SIN": "Jednací síň",
+    "JED_D_ZAC": "Datum a čas jednání",
+    "JED_ZRUS": "Jednání zrušeno",
+}
 
-def format_case_summary(data: dict) -> str:
+
+def format_case_summary(data: dict, subject: str | None = None) -> str:
     """Format case data into human-readable summary."""
     lines = []
     org = data.get("organizace", "?")
@@ -358,6 +499,8 @@ def format_case_summary(data: dict) -> str:
     lines.append(f"Sp. zn.: {spzn}")
     lines.append(f"Soud: {org}" + (f" ({nadr})" if nadr else ""))
     lines.append(f"Stav: {stav}" + (f" (od {stav_datum})" if stav_datum else ""))
+    if subject:
+        lines.append(f"Předmět řízení: {subject}")
 
     platne_k = data.get("platneK", "")
     if platne_k:
@@ -393,26 +536,24 @@ def format_case_summary(data: dict) -> str:
     return "\n".join(lines)
 
 
-def format_hearings_summary(data: dict) -> str:
+def format_hearings_summary(hearings: list[dict],
+                            org: str = "?") -> str:
     """Format hearings data into human-readable summary."""
-    lines = []
-    org = data.get("organizace", "?")
-    lines.append(f"Jednání — {org}")
+    lines = [f"Jednání — {org}"]
 
-    events = data.get("udalosti", [])
-    if not events:
+    if not hearings:
         lines.append("  Žádná jednání nařízena.")
         return "\n".join(lines)
 
-    for ev in events:
+    for ev in hearings:
         datum = ev.get("datum", "?")
         cas = ev.get("cas", "?")
         druh = ev.get("druhJednani", "?")
-        resitel = ev.get("resitel", "?")
         sin = ev.get("jednaciSin", "?")
         zruseno = " [ZRUŠENO]" if ev.get("jednaniZruseno") else ""
         lines.append(f"  {datum} {cas}  {druh}{zruseno}")
-        lines.append(f"    Soudce: {resitel}")
+        if ev.get("resitel"):
+            lines.append(f"    Soudce: {ev['resitel']}")
         lines.append(f"    Síň: {sin}")
 
     return "\n".join(lines)

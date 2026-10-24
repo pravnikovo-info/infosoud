@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "infosoud"
-version = "0.1.0"
+version = "0.2.0"
 description = "Czech court case lookup tool (infosoud.gov.cz)"
 readme = "README.md"
 license = "MIT"
@@ -21,6 +21,7 @@ dependencies = ["requests>=2.20"]
 
 [project.optional-dependencies]
 web = ["flask>=2.0"]
+dev = ["pytest>=7"]
 
 [project.scripts]
 infosoud = "infosoud.__main__:main"
@@ -28,3 +29,8 @@ infosoud = "infosoud.__main__:main"
 [project.urls]
 Homepage = "https://infosoud.pravnikovo.info"
 Repository = "https://github.com/pravnikovo/infosoud"
+Changelog = "https://github.com/pravnikovo/infosoud/blob/main/CHANGELOG.md"
+Issues = "https://github.com/pravnikovo/infosoud/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
